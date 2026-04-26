@@ -1,0 +1,21 @@
+[project]
+name = "swe-bench-purple-agent"
+version = "0.1.0"
+description = "A2A purple agent that solves SWE-bench Pro coding tasks"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "a2a-sdk[http-server]>=0.3.20",
+    "docker>=7.0.0",
+    "openai>=1.0.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "uvicorn>=0.38.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.1",
+]

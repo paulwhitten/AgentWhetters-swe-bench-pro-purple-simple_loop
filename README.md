@@ -110,17 +110,53 @@ and stop running green and purple on the same host.
 | `AZURE_OPENAI_DEPLOYMENT` | | Azure deployment name (overrides `OPENAI_MODEL`) |
 | `AGENT_DEBUG` | `0` | Set to `1` for verbose logging |
 
+## Running an end-to-end scenario
+
+Scenarios run both agents locally against a configurable number of
+SWE-bench Pro instances. They are a **source-tree** workflow — they
+require the sibling green-agent checkout and the `agentbeats/`
+orchestrator package, neither of which is in the published Docker
+image / `dist/` folder.
+
+Prerequisites:
+
+- Both repos cloned side by side: `swe-bench-purple-agent/` and
+  `swe-bench-green-agent/`.
+- A populated `.env` at the purple repo root (copy from
+  `.env.sample`).
+- Docker daemon running (the purple agent talks to it).
+
+Scenario files in this repo:
+
+| File | Instances | Purpose |
+|---|---|---|
+| `scenario-3.toml` | 3 | Quick smoke run |
+| `scenario-10.toml` | 10 | Standard reproducible scope (matches log055/056/118) |
+| `scenario-auto.toml` | 10 | Same scope, auto-launches both agents |
+| `scenario-100.toml` | 100 | Larger evaluation |
+
+Run a 10-instance scenario with verbose logging:
+
+```bash
+cd swe-bench-purple-agent
+source .env
+AGENT_DEBUG=1 uv run python -m agentbeats.run_scenario \
+    scenario-auto.toml --show-logs 2>&1 | tee ../temp/run.log
+```
+
+`scenario-auto.toml` starts both agents itself; the other scenario
+files assume green and purple are already running. The orchestrator
+streams progress to stdout and writes per-instance results into the
+green agent's `/results` endpoint.
+
 ## Architecture
 
 ```
 src/purple/
-  server.py          – A2A server, agent executor, LLM prompts, solve pipeline
+  server.py          – A2A server, simple agent loop, test gate, QA fix phase
   docker_runner.py   – Docker container lifecycle, exec commands, read files, apply patches
 ```
 
-**Solve pipeline:**
-
-- **Localization**: LLM analyses the file tree + problem statement to pick 3-8 files
-- **Generation**: LLM reads the file contents and produces a unified diff
-- **Repair loop**: if `git apply` fails, the error is fed back to the LLM (up to 2 retries)
-- **Verification**: the patch is applied in the container and `git diff` confirms the result
+See [`docs/architecture-simple_loop.md`](../docs/architecture-simple_loop.md)
+for the full architecture reference, including the test-gate
+flowchart, model-aware prompt selection, and known limitations.

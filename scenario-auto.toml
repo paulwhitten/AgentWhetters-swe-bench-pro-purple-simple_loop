@@ -1,0 +1,18 @@
+# Full auto-start scenario: launches both green + purple, then runs evaluation.
+#
+# Usage:
+#   source .env
+#   AGENT_DEBUG=1 uv run python -m agentbeats.run_scenario scenario-auto.toml --show-logs
+
+[green_agent]
+endpoint = "http://127.0.0.1:9009"
+cmd = "uv run python src/server.py --host 127.0.0.1 --port 9009"
+cwd = "../AgentWhetters-swe-bench-pro-green"
+
+[[participants]]
+role = "coding_agent"
+endpoint = "http://127.0.0.1:9022"
+cmd = "uv run src/purple/server.py --host 127.0.0.1 --port 9022 --debug"
+
+[config]
+num_instances = 10

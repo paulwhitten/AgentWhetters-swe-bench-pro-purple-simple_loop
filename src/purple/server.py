@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import datetime as dt
+import faulthandler
 import json
 import logging
 import os
 import re
+import resource
+import signal
 import sys
 import textwrap
 import time
 from pathlib import Path
+
+faulthandler.enable()
 
 import uvicorn
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -59,14 +65,41 @@ from purple.docker_runner import DockerRunner
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Active container registry — ensure cleanup on unexpected process exit
+# ---------------------------------------------------------------------------
+
+_active_runners: list[DockerRunner] = []
+
+
+def _cleanup_active_runners() -> None:
+    """Stop all tracked containers. Called via atexit / signal handler."""
+    for runner in list(_active_runners):
+        try:
+            runner.stop()
+        except Exception:
+            pass
+    _active_runners.clear()
+
+
+def _signal_cleanup(signum: int, _frame) -> None:
+    _cleanup_active_runners()
+    sys.exit(128 + signum)
+
+
+atexit.register(_cleanup_active_runners)
+for _sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(_sig, _signal_cleanup)
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 STEP_LIMIT = 50               # Global step limit
-QA_BUDGET = 15                # Extra steps for post-done test-gate fix phase
+QA_BUDGET = 5                 # Extra steps for post-done test-gate fix phase
 TOOL_RESULT_LIMIT = 30_000    # Max characters per tool result
 COMMAND_TIMEOUT = 300          # Per-command timeout in seconds
-TEST_FAILURE_EXTRACT_LIMIT = 3000
+TEST_FAILURE_EXTRACT_LIMIT = 6000
+QA_STALE_CAP = 2              # Abort QA after N gate rejections with unchanged diff
 LOG_DIR = Path("logs")
 COMPACT_THRESHOLD = 200_000   # Server-side compaction threshold (tokens)
 
@@ -175,6 +208,27 @@ SYSTEM_PROMPT_REASONING = textwrap.dedent("""\
     If any check fails, fix the issue first. Only call done when confident.
     </validation>
 
+    <dig_deeper>
+    Before declaring a fix complete, look past the first plausible solution:
+    - Re-read the problem statement. Are there secondary requirements you missed?
+    - Check: does your fix handle the EMPTY case? The NULL case? The boundary case?
+    - Look at neighboring code for patterns your fix must be consistent with
+      (e.g. if sibling functions return null on missing keys, yours must too).
+    - If the problem mentions multiple scenarios, verify EACH one, not just the
+      first you found.
+    Do NOT call done after fixing only the obvious symptom. Verify the full scope.
+    </dig_deeper>
+
+    <self_test>
+    Before calling done, run a quick targeted test yourself:
+    - If a test command is available, run it (or a subset of it) to confirm your
+      fix passes. This saves a round-trip through the gate.
+    - If you can write a quick sanity check (node -e, python -c), do so to verify
+      edge cases.
+    - If the test suite is too slow, run just the file or module you changed.
+    Finding failures yourself is cheaper than having done rejected.
+    </self_test>
+
     <rules>
     - Read a file before modifying it
     - Do NOT modify test files unless required
@@ -248,6 +302,21 @@ SYSTEM_PROMPT_CLASSIC = textwrap.dedent("""\
     - For new functions: do they handle null, undefined, [], falsy inputs?
     - Did tests pass? If not, fix before calling done.
     </self_check>
+
+    <dig_deeper>
+    Before declaring a fix complete, look past the first plausible solution:
+    - Re-read the problem statement. Are there secondary requirements you missed?
+    - Check: does your fix handle the EMPTY case? The NULL case? The boundary?
+    - Look at neighboring code for patterns your fix must match.
+    Do NOT call done after fixing only the obvious symptom. Verify full scope.
+    </dig_deeper>
+
+    <self_test>
+    Before calling done, run a quick targeted test yourself:
+    - Run the test suite (or a subset) to confirm your fix passes.
+    - A quick sanity check (node -e, python -c) can catch edge cases cheaply.
+    Finding failures yourself is cheaper than having done rejected.
+    </self_test>
 """)
 
 
@@ -386,7 +455,12 @@ def _start_required_services(runner: DockerRunner) -> list[str]:
 
 
 def _discover_test_command(runner: DockerRunner) -> str | None:
-    """Probe the container to find a working test command."""
+    """Probe the container to find a working test command.
+
+    Strategy: discover the repo's *own* test runner and flags first (from
+    config files, Makefiles, package.json scripts) then append only minimal
+    formatting flags that don't change test selection or plugin behaviour.
+    """
     # Node.js
     r = runner.run("cat package.json 2>/dev/null")
     if r.exit_code == 0 and r.output.strip():
@@ -400,12 +474,17 @@ def _discover_test_command(runner: DockerRunner) -> str | None:
         except json.JSONDecodeError:
             pass
 
-    # Python
+    # Python — detect pytest or unittest
     r = runner.run("test -f pytest.ini -o -f setup.cfg -o -f pyproject.toml && echo found")
     if r.exit_code == 0 and "found" in r.output:
         r2 = runner.run("python -m pytest --version 2>/dev/null")
         if r2.exit_code == 0:
-            return "python -m pytest -x --tb=short -q"
+            # Use repo's own addopts/flags as-is. Only append formatting
+            # flags that control output shape without altering test selection
+            # or plugin behaviour: --tb=short (compact tracebacks), -q (less
+            # boilerplate). Avoid -rfE, -x, -p no:* — these interact badly
+            # with repo plugins (e.g. pytest-rerunfailures, conftest hooks).
+            return "python -m pytest --tb=short -q"
         r2 = runner.run("python -m unittest discover --help 2>/dev/null")
         if r2.exit_code == 0:
             return "python -m unittest discover -s tests"
@@ -425,12 +504,189 @@ def _discover_test_command(runner: DockerRunner) -> str | None:
     if r.exit_code == 0 and "found" in r.output:
         return "cargo test"
 
+    # C/C++ — cmake or make
+    r = runner.run("test -f CMakeLists.txt && echo found")
+    if r.exit_code == 0 and "found" in r.output:
+        return "cmake --build build --target test 2>/dev/null || make test"
+
     # Ruby
     r = runner.run("test -f Gemfile && grep -q 'rspec\\|minitest' Gemfile 2>/dev/null && echo found")
     if r.exit_code == 0 and "found" in r.output:
         return "bundle exec rake test"
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Patch-targeted (F2P) test selection — Phase 0: shadow mode only.
+# These helpers derive a scoped test command from `git diff --name-only` and
+# language-specific peer rules. The result is used **for logging only** in
+# this phase; the broad gate continues to be the verdict authority.
+# See docs/plan.md §3 and docs/f2p_strategy.md.
+# ---------------------------------------------------------------------------
+
+def _derive_scoped_test_cmd(runner: DockerRunner, base_commit: str) -> tuple[str | None, list[str]]:
+    """Return (scoped_cmd, changed_files) for the current working tree.
+
+    `scoped_cmd` is None when no peer tests can be confidently mapped from
+    the patch. Strategy 1 only — peer-rules table from docs/f2p_strategy.md.
+    """
+    diff_files = runner.run(f"git diff --name-only {base_commit}")
+    if diff_files.exit_code != 0:
+        return None, []
+    changed = [p for p in diff_files.output.splitlines() if p.strip()]
+    if not changed:
+        return None, []
+
+    py_targets: set[str] = set()
+    go_pkgs: set[str] = set()
+    js_targets: set[str] = set()
+
+    for path in changed:
+        # Skip patch artifacts and non-source paths
+        if path in ("fix.patch",) or path.startswith(".git/"):
+            continue
+
+        if path.endswith(".py"):
+            basename = path.rsplit("/", 1)[-1]
+            is_test_file = basename.startswith("test_") or "/test" in path or path.startswith("test")
+
+            if is_test_file:
+                # Fix 1: patch modifies a test file directly — run it as-is.
+                # Covers qutebrowser, openlibrary, and any project where the
+                # patch ships both source and test changes.
+                py_targets.add(path)
+            else:
+                # Fix 2: use recursive `find` instead of a fixed-depth candidate
+                # list. This catches deeply-nested test dirs like ansible's
+                # test/units/module_utils/test_<stem>.py that fixed paths miss.
+                parts = path.split("/")
+                stem = parts[-1][:-3]
+                find_r = runner.run(
+                    f"find . -name 'test_{stem}.py' -not -path '*/.git/*' 2>/dev/null | head -5"
+                )
+                for line in find_r.output.splitlines():
+                    cand = line.strip().lstrip("./")
+                    if cand:
+                        py_targets.add(cand)
+                # Some projects use <stem>_test.py (pytest-compat)
+                find_r2 = runner.run(
+                    f"find . -name '{stem}_test.py' -not -path '*/.git/*' 2>/dev/null | head -3"
+                )
+                for line in find_r2.output.splitlines():
+                    cand = line.strip().lstrip("./")
+                    if cand:
+                        py_targets.add(cand)
+
+        # Go: lib/x/y/z.go -> go test ./lib/x/y/...
+        elif path.endswith(".go") and not path.endswith("_test.go"):
+            parts = path.split("/")
+            if len(parts) > 1:
+                pkg_dir = "/".join(parts[:-1])
+                go_pkgs.add(f"./{pkg_dir}/...")
+
+        # JS / TS
+        elif any(path.endswith(ext) for ext in (".js", ".ts", ".jsx", ".tsx")):
+            parts = path.split("/")
+            basename_js = parts[-1]
+            stem = basename_js.rsplit(".", 1)[0]
+            ext = basename_js.rsplit(".", 1)[1]
+
+            # If the patch touches a test file itself, run it directly.
+            is_js_test = (
+                ".test." in path
+                or ".spec." in path
+                or "/test/" in path
+                or "/tests/" in path
+                or path.startswith("test/")
+                or path.startswith("tests/")
+            )
+            if is_js_test:
+                js_targets.add(path)
+                continue
+
+            rel = "/".join(parts[1:-1]) if len(parts) > 2 else ""
+
+            # .test.ext peers (Jest / Mocha with file-level naming)
+            dot_test_candidates = [
+                f"test/{rel}/{stem}.test.{ext}".replace("//", "/"),
+                f"tests/{rel}/{stem}.test.{ext}".replace("//", "/"),
+                f"__tests__/{stem}.test.{ext}",
+                f"{'/'.join(parts[:-1])}/__tests__/{stem}.test.{ext}",
+            ]
+            for cand in dot_test_candidates:
+                if not cand or cand.startswith("/"):
+                    continue
+                check = runner.run(f"test -f {cand!s} && echo found")
+                if check.exit_code == 0 and "found" in check.output:
+                    js_targets.add(cand)
+
+            # Fix 3: flat Mocha convention — test/<stem>.js (NodeBB, many OSS
+            # projects). Uses find to tolerate arbitrary depth under test/.
+            find_js = runner.run(
+                f"find test tests -maxdepth 4 -name '{stem}.js' 2>/dev/null | head -5"
+            )
+            for line in find_js.output.splitlines():
+                cand = line.strip().lstrip("./")
+                if cand:
+                    js_targets.add(cand)
+
+    # Compose a single shell command. Prefer the runner that matches the
+    # majority of changed files; if a single language dominates, use it.
+    if go_pkgs:
+        return f"go test {' '.join(sorted(go_pkgs))}", changed
+    if py_targets:
+        return f"python -m pytest --tb=short -q {' '.join(sorted(py_targets))}", changed
+    if js_targets:
+        # Use npx mocha if available, else npm test with the file list.
+        # Mocha pattern is the most portable; npm test ignores extra args
+        # without `--` for many projects, so we prefer mocha here.
+        return f"npx --no-install mocha {' '.join(sorted(js_targets))}", changed
+    return None, changed
+
+
+def _shadow_gate(
+    runner: DockerRunner,
+    base_commit: str,
+    broad_passed: bool,
+    timeout: int,
+) -> dict:
+    """Run the scoped command (if any) and return an audit record.
+
+    Strictly logging — caller must not use the result to decide verdicts.
+    """
+    scoped_cmd, changed = _derive_scoped_test_cmd(runner, base_commit)
+    audit: dict = {
+        "changed_files": changed,
+        "scoped_cmd": scoped_cmd,
+        "scoped_exit_code": None,
+        "scoped_passed": None,
+        "broad_passed": broad_passed,
+        "agreement": "scoped_skipped",
+    }
+    if scoped_cmd is None:
+        return audit
+    try:
+        result = runner.run(scoped_cmd, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — defensive in shadow path
+        audit["scoped_exit_code"] = -1
+        audit["scoped_passed"] = False
+        audit["scoped_error"] = str(exc)[:200]
+        audit["agreement"] = "scoped_error"
+        return audit
+    audit["scoped_exit_code"] = result.exit_code
+    scoped_passed = result.exit_code == 0
+    audit["scoped_passed"] = scoped_passed
+    audit["scoped_output_tail"] = (result.output or "")[-1500:]
+    if scoped_passed and broad_passed:
+        audit["agreement"] = "agree_pass"
+    elif (not scoped_passed) and (not broad_passed):
+        audit["agreement"] = "agree_fail"
+    elif scoped_passed and not broad_passed:
+        audit["agreement"] = "scoped_pass_broad_fail"
+    else:
+        audit["agreement"] = "scoped_fail_broad_pass"
+    return audit
 
 
 def _extract_test_failures(output: str) -> str:
@@ -493,6 +749,116 @@ def _extract_test_failures(output: str) -> str:
     if remaining > 200:
         summary += output[:remaining]
     return summary
+
+
+def _extract_failure_ids(output: str) -> set[str]:
+    """Extract a set of failure identifiers from test runner output.
+
+    Covers pytest, go test (including gocheck), mocha/npm, and jest.
+    Returns normalised strings so baseline vs gate comparison is stable.
+    """
+    ids: set[str] = set()
+    for line in output.splitlines():
+        stripped = line.strip()
+
+        # -- pytest --
+        # "FAILED tests/foo.py::test_bar - reason"
+        if stripped.startswith("FAILED "):
+            ids.add(stripped.split(" - ")[0].strip())
+        # Rerun-failed: "RERUN tests/foo.py::test_bar - reason"
+        # (defensive: shown with -rR when rerunfailures plugin is active)
+        elif stripped.startswith("RERUN ") and "::" in stripped:
+            ids.add("FAILED " + stripped[6:].split(" - ")[0].strip())
+        # Collection error: "ERROR test/foo.py" or "ERROR collecting ..."
+        elif stripped.startswith("ERROR ") and not stripped.startswith("ERROR!"):
+            ids.add(stripped)
+
+        # -- go test --
+        # "--- FAIL: TestName (0.00s)"
+        elif stripped.startswith("--- FAIL:"):
+            ids.add(stripped.split("(")[0].strip())
+        # gocheck: "FAIL: password_test.go:104: PasswordSuite.TestTiming"
+        elif stripped.startswith("FAIL:") and ".go:" in stripped:
+            ids.add(stripped)
+        # Package-level: "FAIL    github.com/org/repo/pkg    1.23s"
+        elif stripped.startswith("FAIL\t") or stripped.startswith("FAIL    "):
+            pkg = stripped.split()[1] if len(stripped.split()) > 1 else stripped
+            ids.add(f"FAIL {pkg}")
+
+        # -- mocha/npm --
+        # Numbered failure: "1) suite name > test name:"
+        elif re.match(r"^\d+\)", stripped):
+            ids.add(stripped.rstrip(":"))
+
+        # -- jest --
+        # "FAIL src/components/Foo.test.tsx"
+        # (Jest uses FAIL without :: unlike pytest)
+        # Already covered by startswith("FAIL ") above if it has a space
+
+        # -- Infrastructure errors --
+        # "sh: 1: jest: not found"
+        elif re.match(r"^sh: \d+: .+: not found", stripped):
+            ids.add(stripped)
+        # C/C++ build failure: "FAIL" alone on a line (go build failure)
+        # Skip bare "FAIL" — too ambiguous
+
+        # -- Process crashes --
+        # "Fatal Python error:"
+        elif "Fatal Python error" in stripped:
+            ids.add("Fatal Python error")
+
+        # -- Timeouts --
+        # Our wrapper: "[command timed out after 300s]"
+        elif "command timed out" in stripped:
+            ids.add(stripped)
+        # "timeout: the monitored command dumped core"
+        elif stripped.startswith("timeout: the monitored command"):
+            ids.add(stripped)
+
+    return ids
+
+
+def _gate_passes_with_baseline(
+    gate_exit_code: int,
+    gate_output: str,
+    baseline_exit_code: int | None,
+    baseline_output: str,
+) -> tuple[bool, set[str], set[str]]:
+    """Determine if the test gate passes after accounting for pre-existing failures.
+
+    Returns (passes, new_failures, baseline_failures).
+    - If the gate exit code is 0, passes unconditionally.
+    - If the baseline also failed, compares failure IDs: passes when every
+      gate failure also existed in the baseline (no new regressions).
+    - If both sides failed but the parser extracted 0 IDs from both (opaque
+      output), treat as same unknown failure state and pass permissively.
+    - If the baseline was clean (exit 0 or not available), falls back to
+      raw exit code.
+    """
+    baseline_ids: set[str] = set()
+    gate_ids = _extract_failure_ids(gate_output)
+
+    # Gate passes outright
+    if gate_exit_code == 0:
+        return True, set(), baseline_ids
+
+    # No baseline to compare against — fall back to exit code
+    if baseline_exit_code is None or baseline_exit_code == 0:
+        return False, gate_ids, baseline_ids
+
+    # Both baseline and gate failed — compare failure sets
+    baseline_ids = _extract_failure_ids(baseline_output)
+    new_failures = gate_ids - baseline_ids
+
+    # If the parser extracted 0 IDs from both sides (e.g. the runner
+    # crashed, output format is unrecognised, or exit code reflects a
+    # configuration error like exit 4), assume the same opaque failure
+    # persists and pass permissively rather than blocking the patch.
+    if not gate_ids and not baseline_ids:
+        return True, set(), set()
+
+    passes = len(new_failures) == 0 and len(gate_ids) > 0
+    return passes, new_failures, baseline_ids
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -620,6 +986,7 @@ async def solve_instance(
 
     try:
         await loop.run_in_executor(None, runner.start)
+        _active_runners.append(runner)
 
         # Start required services
         svc_msgs = await loop.run_in_executor(None, lambda: _start_required_services(runner))
@@ -642,13 +1009,28 @@ async def solve_instance(
 
         # Run baseline tests to capture current failures (skip if all pass)
         baseline_failures = ""
+        baseline_exit_code: int | None = None
+        baseline_output_raw = ""
         if test_cmd:
             await status("Running baseline tests...")
             baseline_result = await loop.run_in_executor(
                 None, lambda: runner.run(test_cmd, timeout=COMMAND_TIMEOUT)
             )
+            baseline_exit_code = baseline_result.exit_code
+            baseline_output_raw = baseline_result.output or ""
             if baseline_result.exit_code != 0:
                 baseline_failures = _extract_test_failures(baseline_result.output)
+                # Save raw baseline to container for deterministic comparison
+                await loop.run_in_executor(
+                    None,
+                    lambda: runner.write_file(
+                        ".swe_baseline_test_output.txt",
+                        baseline_output_raw[:50_000],
+                    ),
+                )
+                clog.log("baseline_test",
+                         exit_code=baseline_exit_code,
+                         failure_ids=sorted(_extract_failure_ids(baseline_output_raw))[:20])
                 await status(f"Baseline tests found failures (exit code {baseline_result.exit_code})")
             else:
                 await status("Baseline tests all pass — skipping injection")
@@ -665,7 +1047,9 @@ async def solve_instance(
             user_content += (
                 f"\n## Baseline test failures (before any changes):\n"
                 f"```\n{_truncate(baseline_failures, 4000)}\n```\n"
-                f"\nThese are the tests you must make pass. Fix these specific failures.\n"
+                f"\nThese test failures exist BEFORE your changes — they are pre-existing issues "
+                f"in the repository. Do NOT attempt to fix them. Focus only on the problem "
+                f"statement above. The test gate will account for these pre-existing failures.\n"
             )
         user_content += (
             "\nSolve this problem. Read relevant files, understand the root cause, "
@@ -687,9 +1071,39 @@ async def solve_instance(
         qa_steps_used = 0               # Steps consumed in QA fix phase
         total_steps = 0                 # Tracks total steps across main + QA
         step = 0
+        cumulative_input_tokens = 0
+        cumulative_output_tokens = 0
+        cumulative_cached_tokens = 0
+
+        # ---- QA-phase instrumentation ----
+        # gate_outcome_first: outcome of the *first* test-gate evaluation.
+        #   "pass" / "fail" — gate ran and returned that result
+        #   "empty_patch"   — done rejected because git diff was empty
+        #   "no_gate"       — done accepted with no test_cmd discovered
+        #   "no_done"       — main loop hit STEP_LIMIT without calling done
+        # gate_outcome_after_qa: outcome of the *last* gate run during QA
+        #   (or None if QA never ran a gate)
+        # diff_before_qa: git diff captured at QA-phase entry
+        # diff_after_qa:  git diff captured at QA-phase exit
+        # patch_changed_in_qa: bool, did the agent edit anything during QA
+        gate_outcome_first: str | None = None
+        gate_outcome_after_qa: str | None = None
+        diff_before_qa: str | None = None
+        diff_after_qa: str | None = None
+        patch_changed_in_qa: bool | None = None
 
         for step in range(STEP_LIMIT):
             await status(f"Step {step + 1}")
+
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            clog.log(
+                "step_resources",
+                step=step,
+                rss_mb=round(rss_mb, 1),
+                items_count=len(items),
+                cumulative_input_tokens=cumulative_input_tokens,
+                cumulative_output_tokens=cumulative_output_tokens,
+            )
 
             # Build API request
             api_kwargs: dict = {
@@ -716,6 +1130,11 @@ async def solve_instance(
 
             response = await client.responses.create(**api_kwargs)
             usage = response.usage
+            if usage:
+                cumulative_input_tokens += usage.input_tokens
+                cumulative_output_tokens += usage.output_tokens
+                cached = getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0
+                cumulative_cached_tokens += cached
 
             # Parse response
             shell_calls = []
@@ -753,6 +1172,7 @@ async def solve_instance(
                 usage={
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
+                    "cached_tokens": cached,
                 } if usage else None,
             )
 
@@ -806,30 +1226,73 @@ async def solve_instance(
                     args = {}
 
                 if name == "done":
+                    # ------- Empty-patch guard -------
+                    diff_so_far = await loop.run_in_executor(None, runner.get_diff)
+                    if not diff_so_far.strip():
+                        qa_gate_failed = True
+                        if gate_outcome_first is None:
+                            gate_outcome_first = "empty_patch"
+                        result = (
+                            "DONE REJECTED — no changes detected (`git diff` is empty). "
+                            "You have not edited any files. Make the required edits before calling done."
+                        )
+                        clog.log("empty_patch_guard", phase="initial", rejected=True)
+                        await status("Empty patch — rejecting done")
                     # ------- Mechanical test gate -------
-                    if test_cmd:
+                    elif test_cmd:
                         await status(f"Agent signalled done — running test gate: {test_cmd}")
                         gate_result = await loop.run_in_executor(
                             None, lambda: runner.run(test_cmd, timeout=COMMAND_TIMEOUT),
                         )
-                        gate_passed = gate_result.exit_code == 0
+                        gate_passed, new_fails, base_fails = _gate_passes_with_baseline(
+                            gate_result.exit_code, gate_result.output or "",
+                            baseline_exit_code, baseline_output_raw,
+                        )
+                        if gate_outcome_first is None:
+                            gate_outcome_first = "pass" if gate_passed else "fail"
                         clog.log("test_gate", command=test_cmd, passed=gate_passed,
+                                 raw_exit_code=gate_result.exit_code,
+                                 baseline_filtered=gate_result.exit_code != 0 and gate_passed,
+                                 new_failures=sorted(new_fails)[:10],
+                                 baseline_failures=sorted(base_fails)[:10],
                                  output=_truncate(gate_result.output or "", 5000))
+                        # Shadow-mode F2P audit (logging only — no verdict change)
+                        try:
+                            audit = await loop.run_in_executor(
+                                None,
+                                lambda: _shadow_gate(runner, base_commit, gate_passed, COMMAND_TIMEOUT),
+                            )
+                            clog.log("gate_scope_audit", phase="initial", **audit)
+                        except Exception as exc:  # noqa: BLE001
+                            clog.log("gate_scope_audit", phase="initial", error=str(exc)[:200])
                         if not gate_passed:
                             # Reject done — inject failure output
                             qa_gate_failed = True
                             fail_output = _truncate(gate_result.output or "(no output)", TEST_FAILURE_EXTRACT_LIMIT)
+                            new_fail_hint = ""
+                            if new_fails:
+                                new_fail_hint = (
+                                    "\nThese are NEW failures introduced by your changes "
+                                    "(pre-existing failures have been filtered):\n"
+                                    + "\n".join(sorted(new_fails)[:10]) + "\n"
+                                )
                             result = (
                                 f"DONE REJECTED — tests still fail. Fix the tests before calling done.\n"
                                 f"Test command: {test_cmd}\n"
+                                f"{new_fail_hint}"
                                 f"Test output:\n{fail_output}"
                             )
                             await status(f"Test gate FAILED — rejecting done")
                         else:
-                            await status(f"Test gate passed — accepting done: {args.get('explanation', '')[:100]}")
+                            baseline_note = ""
+                            if gate_result.exit_code != 0:
+                                baseline_note = " (pre-existing failures filtered)"
+                            await status(f"Test gate passed{baseline_note} — accepting done: {args.get('explanation', '')[:100]}")
                             result = "Done acknowledged. Tests pass. The patch will be collected."
                             done_signalled = True
                     else:
+                        if gate_outcome_first is None:
+                            gate_outcome_first = "no_gate"
                         await status(f"Agent done: {args.get('explanation', '')[:100]}")
                         result = "Done acknowledged. The patch will be collected."
                         done_signalled = True
@@ -886,21 +1349,47 @@ async def solve_instance(
             gate_result = await loop.run_in_executor(
                 None, lambda: runner.run(test_cmd, timeout=COMMAND_TIMEOUT),
             )
-            gate_passed = gate_result.exit_code == 0
+            gate_passed, new_fails, base_fails = _gate_passes_with_baseline(
+                gate_result.exit_code, gate_result.output or "",
+                baseline_exit_code, baseline_output_raw,
+            )
+            if gate_outcome_first is None:
+                gate_outcome_first = "no_done_pass" if gate_passed else "no_done_fail"
             clog.log("test_gate_limit", command=test_cmd, passed=gate_passed,
+                     raw_exit_code=gate_result.exit_code,
+                     baseline_filtered=gate_result.exit_code != 0 and gate_passed,
+                     new_failures=sorted(new_fails)[:10],
                      output=_truncate(gate_result.output or "", 5000))
+            # Shadow-mode F2P audit (logging only)
+            try:
+                audit = await loop.run_in_executor(
+                    None,
+                    lambda: _shadow_gate(runner, base_commit, gate_passed, COMMAND_TIMEOUT),
+                )
+                clog.log("gate_scope_audit", phase="step_limit", **audit)
+            except Exception as exc:  # noqa: BLE001
+                clog.log("gate_scope_audit", phase="step_limit", error=str(exc)[:200])
             if gate_passed:
-                await status("Tests pass despite no done signal — accepting patch")
+                baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
+                await status(f"Tests pass{baseline_note} despite no done signal — accepting patch")
                 done_signalled = True
             else:
                 qa_gate_failed = True
                 fail_output = _truncate(gate_result.output or "(no output)", TEST_FAILURE_EXTRACT_LIMIT)
+                new_fail_hint = ""
+                if new_fails:
+                    new_fail_hint = (
+                        "\nThese are NEW failures introduced by your changes "
+                        "(pre-existing failures have been filtered):\n"
+                        + "\n".join(sorted(new_fails)[:10]) + "\n"
+                    )
                 items.append({
                     "role": "user",
                     "content": (
                         f"You ran out of steps without calling done. Tests are FAILING.\n"
                         f"You have {QA_BUDGET} extra steps to fix the failing tests and call done.\n"
                         f"Test command: {test_cmd}\n"
+                        f"{new_fail_hint}"
                         f"Test output:\n{fail_output}"
                     ),
                 })
@@ -910,6 +1399,13 @@ async def solve_instance(
         # QA FIX PHASE — if test gate rejected done or step limit hit
         # -----------------------------------------------------------
         if qa_gate_failed and not done_signalled:
+            # Snapshot the diff at QA entry so we can detect whether the
+            # patch changed during QA (instrumentation for QA-utility
+            # analysis — see docs/plan.md workstream 2).
+            diff_before_qa = await loop.run_in_executor(None, runner.get_diff)
+            clog.log("qa_phase_start", diff_len=len(diff_before_qa.strip()))
+            qa_stale_reject_count = 0       # consecutive gate rejections w/ unchanged diff
+            qa_last_rejected_diff: str | None = None
             for qa_step in range(QA_BUDGET):
                 qa_steps_used = qa_step + 1
                 total_steps += 1
@@ -935,6 +1431,12 @@ async def solve_instance(
                     api_kwargs_qa["max_output_tokens"] = 4096
 
                 response = await client.responses.create(**api_kwargs_qa)
+                qa_usage = response.usage
+                if qa_usage:
+                    cumulative_input_tokens += qa_usage.input_tokens
+                    cumulative_output_tokens += qa_usage.output_tokens
+                    cached = getattr(getattr(qa_usage, "input_tokens_details", None), "cached_tokens", 0) or 0
+                    cumulative_cached_tokens += cached
                 items.extend(response.output)
 
                 # Drop items before latest compaction
@@ -993,27 +1495,80 @@ async def solve_instance(
                         fc_args = {}
 
                     if fc_name == "done":
+                        # ------- Empty-patch guard -------
+                        diff_so_far = await loop.run_in_executor(None, runner.get_diff)
+                        if not diff_so_far.strip():
+                            remaining = QA_BUDGET - qa_steps_used
+                            fc_result = (
+                                "DONE REJECTED — no changes detected (`git diff` is empty). "
+                                f"Make the required edits before calling done. {remaining} QA steps remaining."
+                            )
+                            gate_outcome_after_qa = "empty_patch"
+                            clog.log("empty_patch_guard", phase="qa", rejected=True)
+                            await status("Empty patch — rejecting QA done")
+                            items.append({
+                                "type": "function_call_output",
+                                "call_id": fc.call_id,
+                                "output": fc_result,
+                            })
+                            continue
                         # Re-run test gate
                         await status(f"QA done — re-running test gate: {test_cmd}")
                         gate_result = await loop.run_in_executor(
                             None, lambda: runner.run(test_cmd, timeout=COMMAND_TIMEOUT),
                         )
-                        gate_passed = gate_result.exit_code == 0
+                        gate_passed, new_fails, base_fails = _gate_passes_with_baseline(
+                            gate_result.exit_code, gate_result.output or "",
+                            baseline_exit_code, baseline_output_raw,
+                        )
+                        gate_outcome_after_qa = "pass" if gate_passed else "fail"
                         clog.log("test_gate_qa", command=test_cmd, passed=gate_passed,
+                                 raw_exit_code=gate_result.exit_code,
+                                 baseline_filtered=gate_result.exit_code != 0 and gate_passed,
+                                 new_failures=sorted(new_fails)[:10],
                                  output=_truncate(gate_result.output or "", 5000))
+                        # Shadow-mode F2P audit (logging only)
+                        try:
+                            audit = await loop.run_in_executor(
+                                None,
+                                lambda: _shadow_gate(runner, base_commit, gate_passed, COMMAND_TIMEOUT),
+                            )
+                            clog.log("gate_scope_audit", phase="qa", **audit)
+                        except Exception as exc:  # noqa: BLE001
+                            clog.log("gate_scope_audit", phase="qa", error=str(exc)[:200])
                         if gate_passed:
-                            await status(f"QA test gate passed — accepting done")
+                            baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
+                            await status(f"QA test gate passed{baseline_note} — accepting done")
                             fc_result = "Done acknowledged. Tests pass. The patch will be collected."
                             done_signalled = True
                             qa_done = True
                         else:
                             remaining = QA_BUDGET - qa_steps_used
                             fail_output = _truncate(gate_result.output or "(no output)", TEST_FAILURE_EXTRACT_LIMIT)
+                            new_fail_hint = ""
+                            if new_fails:
+                                new_fail_hint = (
+                                    "\nNEW failures introduced by your changes:\n"
+                                    + "\n".join(sorted(new_fails)[:10]) + "\n"
+                                )
                             fc_result = (
                                 f"DONE REJECTED — tests still fail. {remaining} QA steps remaining.\n"
+                                f"{new_fail_hint}"
                                 f"Test output:\n{fail_output}"
                             )
                             await status(f"QA test gate still failing — {remaining} steps left")
+                            # Stale-QA cap: abort if diff unchanged across consecutive rejections
+                            current_diff = diff_so_far.strip()
+                            if qa_last_rejected_diff is not None and current_diff == qa_last_rejected_diff:
+                                qa_stale_reject_count += 1
+                            else:
+                                qa_stale_reject_count = 1
+                            qa_last_rejected_diff = current_diff
+                            if qa_stale_reject_count >= QA_STALE_CAP:
+                                clog.log("qa_stale_abort", stale_rejections=qa_stale_reject_count,
+                                         qa_steps_used=qa_steps_used)
+                                await status(f"QA abort — patch unchanged across {qa_stale_reject_count} rejections")
+                                qa_done = True  # break out of QA loop
                     elif fc_name == "run_command":
                         command = fc_args.get("command", "echo '(no command)'")
                         preview = command[:80]
@@ -1051,10 +1606,55 @@ async def solve_instance(
         # Collect the diff
         diff = await loop.run_in_executor(None, runner.get_diff)
 
+        # ---- QA-phase instrumentation summary ----
+        # If QA ran, capture the post-QA diff and decide whether the
+        # patch actually changed during QA. This lets us answer "does
+        # QA ever rescue an instance?" from logs alone.
+        if diff_before_qa is not None:
+            diff_after_qa = diff
+            patch_changed_in_qa = diff_before_qa.strip() != diff_after_qa.strip()
+            clog.log(
+                "qa_summary",
+                gate_outcome_first=gate_outcome_first,
+                qa_turns_used=qa_steps_used,
+                gate_outcome_after_qa=gate_outcome_after_qa,
+                patch_changed_in_qa=patch_changed_in_qa,
+                diff_before_qa_len=len(diff_before_qa.strip()),
+                diff_after_qa_len=len(diff_after_qa.strip()),
+            )
+
         if diff.strip():
             await status(f"Generated diff ({len(diff)} chars, {total_steps} steps)")
         else:
             await status(f"No diff produced ({total_steps} steps)")
+
+        # ---- Escalation flag ----
+        # Classify instances where the agent couldn't succeed so we can
+        # triage which repos/problems need human guidance or a different
+        # strategy. Escalation reasons are logged but don't change the
+        # patch output — we still return whatever diff exists.
+        escalation_needed = False
+        escalation_reason: str | None = None
+        if not done_signalled and not diff.strip():
+            escalation_needed = True
+            escalation_reason = "no_patch_produced"
+        elif qa_gate_failed and not done_signalled:
+            escalation_needed = True
+            escalation_reason = "qa_budget_exhausted"
+        elif not done_signalled and diff.strip():
+            escalation_needed = True
+            escalation_reason = "step_limit_no_done"
+
+        if escalation_needed:
+            clog.log(
+                "escalation",
+                reason=escalation_reason,
+                steps_used=total_steps,
+                qa_steps_used=qa_steps_used,
+                gate_outcome_first=gate_outcome_first,
+                gate_outcome_after_qa=gate_outcome_after_qa,
+            )
+            await status(f"Escalation flagged: {escalation_reason}")
 
         clog.log(
             "result",
@@ -1062,6 +1662,14 @@ async def solve_instance(
             steps=total_steps,
             qa_steps=qa_steps_used,
             done_signalled=done_signalled,
+            gate_outcome_first=gate_outcome_first,
+            gate_outcome_after_qa=gate_outcome_after_qa,
+            patch_changed_in_qa=patch_changed_in_qa,
+            cumulative_input_tokens=cumulative_input_tokens,
+            cumulative_output_tokens=cumulative_output_tokens,
+            cumulative_cached_tokens=cumulative_cached_tokens,
+            escalation_needed=escalation_needed,
+            escalation_reason=escalation_reason,
         )
         logger.info("[%s] Transcript: %s", instance_id, clog.path)
         # Only strip leading whitespace — trailing whitespace is significant
@@ -1072,6 +1680,8 @@ async def solve_instance(
     finally:
         clog.close()
         await loop.run_in_executor(None, runner.stop)
+        if runner in _active_runners:
+            _active_runners.remove(runner)
         await loop.run_in_executor(None, runner.cleanup_image)
 
 

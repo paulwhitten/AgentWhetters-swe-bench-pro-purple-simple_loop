@@ -199,9 +199,32 @@ def main() -> None:
                 env=base_env,
                 start_new_session=True,
             )
-            # Don't add client_proc to procs — we don't want to kill the
-            # agent servers if the client exits with an error (e.g. timeout).
-            client_proc.wait()
+            # Monitor participant health while client runs; restart crashed agents.
+            while client_proc.poll() is None:
+                for idx, p in enumerate(cfg["participants"]):
+                    proc = procs[idx]
+                    if proc.poll() is not None:
+                        print(
+                            f"\n⚠ {p['role']} agent (PID {proc.pid}) died "
+                            f"with code {proc.returncode} — restarting…"
+                        )
+                        cmd_args = shlex.split(p.get("cmd", ""))
+                        cwd = p.get("cwd") or None
+                        new_proc = subprocess.Popen(
+                            cmd_args,
+                            cwd=cwd,
+                            env=base_env,
+                            stdout=sink,
+                            stderr=sink,
+                            text=True,
+                            start_new_session=True,
+                        )
+                        procs[idx] = new_proc
+                        print(
+                            f"  Restarted {p['role']} agent "
+                            f"(new PID {new_proc.pid})"
+                        )
+                time.sleep(1)
             if client_proc.returncode != 0:
                 print(f"\nClient exited with code {client_proc.returncode}")
 

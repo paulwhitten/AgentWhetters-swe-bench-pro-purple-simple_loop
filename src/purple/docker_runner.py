@@ -99,12 +99,20 @@ class DockerRunner:
     # ------------------------------------------------------------------
 
     def run(self, cmd: str, timeout: int = EXEC_TIMEOUT) -> ExecResult:
-        """Execute a shell command inside the container and return its output."""
+        """Execute a shell command inside the container and return its output.
+
+        docker-py's ``exec_run`` has no per-call timeout. To honor the
+        ``timeout`` argument we wrap the command with coreutils ``timeout``
+        so a hung command cannot consume the whole per-instance budget.
+        On timeout, the wrapper exits with 124 (TERM) or 137 (KILL after
+        grace period) and we annotate the output.
+        """
         if not self._container:
             raise RuntimeError("Container not started")
 
+        wrapped = ["timeout", "--kill-after=5", f"{timeout}s", "bash", "-c", cmd]
         exec_result = self._container.exec_run(
-            ["bash", "-c", cmd],
+            wrapped,
             workdir=REPO_DIR,
             demux=True,
         )
@@ -113,6 +121,9 @@ class DockerRunner:
         combined = stdout
         if stderr:
             combined = combined + "\n" + stderr if combined else stderr
+        if exec_result.exit_code in (124, 137):
+            note = f"\n[command timed out after {timeout}s]"
+            combined = combined + note if combined else note.lstrip("\n")
         return ExecResult(exit_code=exec_result.exit_code, output=combined)
 
     def read_file(self, path: str, max_bytes: int = 100_000) -> str:
@@ -165,8 +176,36 @@ class DockerRunner:
 
         return self.run("git apply -v fix.patch && rm fix.patch")
 
+    # Directories whose contents should never appear in a submitted patch.
+    # Matched anywhere in the relative path (e.g. ``src/__pycache__/``).
+    _DIFF_EXCLUDE_DIRS = (
+        "appendonlydir", "node_modules", "__pycache__", ".tox",
+        ".venv", "venv", ".eggs", "htmlcov",
+        ".mypy_cache", ".pytest_cache", ".idea", ".vscode",
+    )
+    # Patterns matched as *substrings* anywhere in the path (for entries
+    # like ``egg-info`` that appear as a suffix: ``my_pkg.egg-info/``).
+    _DIFF_EXCLUDE_SUBSTR = (
+        ".egg-info/",
+    )
+    # File extensions that indicate binary / runtime / build artifacts.
+    # Stored without leading dot; the grep pattern adds ``\.`` prefix.
+    _DIFF_EXCLUDE_EXTS = (
+        "aof", "rdb", "db", "sqlite", "sqlite3",
+        "pyc", "pyo", "o", "so", "dylib", "a",
+        "class", "jar", "war", "whl", "egg",
+        "log", "pid",
+        "png", "jpg", "jpeg", "gif", "ico", "svg",
+        "zip", "tar", "gz", "bz2", "xz",
+    )
+
     def get_diff(self) -> str:
         """Return the current git diff in the container.
+
+        New (untracked) files are discovered via ``git ls-files --others``
+        and selectively staged with ``git add -N`` so they appear in the
+        diff.  Runtime artifacts (database files, compiled objects, package
+        directories, media) are filtered out to keep the patch clean.
 
         Writes to a file first then extracts via Docker archive API to
         avoid exec_run demux truncation (docker-py can drop the last
@@ -175,7 +214,29 @@ class DockerRunner:
         if not self._container:
             raise RuntimeError("Container not started")
         patch_path = "/tmp/_patch.diff"
-        self.run(f"git diff > {patch_path}")
+
+        # Build grep patterns to exclude junk directories and extensions.
+        dir_pat = "|".join(d.replace(".", r"\.") for d in self._DIFF_EXCLUDE_DIRS)
+        ext_pat = "|".join(self._DIFF_EXCLUDE_EXTS)
+        substr_pat = "|".join(
+            s.replace(".", r"\.") for s in self._DIFF_EXCLUDE_SUBSTR
+        )
+
+        # 1. List untracked files (respects .gitignore).
+        # 2. Filter out runtime/data artifacts by directory and extension.
+        # 3. Intent-to-add the remaining files so git diff includes them.
+        # The subshell + || true ensures a zero exit even when grep filters
+        # out every line (exit 1) or there are no untracked files at all.
+        # After the diff is captured, git reset undoes the intent-to-add.
+        self.run(
+            f"(git ls-files --others --exclude-standard"
+            f" | grep -v -E '(^|/)({dir_pat})(/)'"
+            f" | grep -v -E '({substr_pat})'"
+            f" | grep -v -E '\\.({ext_pat})$'"  # noqa: ISC003
+            f" | xargs -r -d '\\n' git add -N -- || true)"
+            f" && git diff > {patch_path}"
+            f" ; git reset 2>/dev/null || true"
+        )
         bits, _stat = self._container.get_archive(patch_path)
         raw = b"".join(bits)
         with tarfile.open(fileobj=io.BytesIO(raw)) as tar:

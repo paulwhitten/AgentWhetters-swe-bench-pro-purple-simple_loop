@@ -160,3 +160,9 @@ src/purple/
 See [`docs/architecture-simple_loop.md`](../docs/architecture-simple_loop.md)
 for the full architecture reference, including the test-gate
 flowchart, model-aware prompt selection, and known limitations.
+
+### running
+
+```
+cd /home/pcw/devel/swe-bench-pro/swe-bench-purple-agent && source .env && AGENT_DEBUG=1 uv run python -m agentbeats.run_scenario scenario-auto.toml --show-logs 2>&1 | tee /home/pcw/devel/swe-bench-pro/temp/log120.txt
+```

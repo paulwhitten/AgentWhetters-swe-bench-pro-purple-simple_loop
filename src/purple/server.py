@@ -53,6 +53,7 @@ from a2a.types import (
 )
 from uuid import uuid4
 from a2a.utils import new_agent_text_message
+import openai
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 
 # Ensure the package root (src/) is on sys.path
@@ -474,6 +475,15 @@ def _discover_test_command(runner: DockerRunner) -> str | None:
         except json.JSONDecodeError:
             pass
 
+    # Ansible — uses a custom pytest runner with a non-standard config path.
+    # Detect by checking for lib/ansible/ + test/units/ directory structure
+    # and pytest availability.
+    r = runner.run("test -d lib/ansible && test -d test/units && echo found")
+    if r.exit_code == 0 and "found" in r.output:
+        r2 = runner.run("python -m pytest --version 2>/dev/null")
+        if r2.exit_code == 0:
+            return "python -m pytest test/units/ --tb=short -q"
+
     # Python — detect pytest or unittest
     r = runner.run("test -f pytest.ini -o -f setup.cfg -o -f pyproject.toml && echo found")
     if r.exit_code == 0 and "found" in r.output:
@@ -861,6 +871,29 @@ def _gate_passes_with_baseline(
     return passes, new_failures, baseline_ids
 
 
+def _go_build_check(runner: DockerRunner, test_cmd: str, timeout: int) -> tuple[bool, str]:
+    """For Go repos, run a compile-only check across all packages.
+
+    The agent's test gate runs `go test ./...` inside its own container where
+    all edits are present — so the build succeeds.  But the grader applies
+    only the diff to a fresh container.  If the agent changed a package's
+    exported API and missed callers in test files it never read, those
+    packages will fail to build.  A compile-only pass (`go test -run=^$ ./...`)
+    catches this cheaply without executing any tests.
+
+    Returns (ok, error_output).  Only called when test_cmd starts with
+    "go test".
+    """
+    if not test_cmd.startswith("go test"):
+        return True, ""
+    # -run=^$ matches no tests — compile-only.  -count=1 avoids cache hits.
+    build_result = runner.run("go test -run=^$ -count=1 ./...", timeout=timeout)
+    if build_result.exit_code == 0:
+        return True, ""
+    # Filter for [build failed] lines which indicate the real problem
+    return False, build_result.output or "(no output)"
+
+
 def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -1128,7 +1161,16 @@ async def solve_instance(
                 api_kwargs["temperature"] = 0.0
                 api_kwargs["max_output_tokens"] = 4096
 
-            response = await client.responses.create(**api_kwargs)
+            try:
+                response = await client.responses.create(**api_kwargs)
+            except openai.BadRequestError as exc:
+                # Content filter or invalid prompt — log and break gracefully
+                logger.warning("[%s] OpenAI rejected prompt at step %d: %s",
+                               instance_id, step, exc)
+                clog.log("api_rejected", step=step, error=str(exc)[:500])
+                await status(f"API rejected prompt at step {step} — returning current diff")
+                break
+
             usage = response.usage
             if usage:
                 cumulative_input_tokens += usage.input_tokens
@@ -1284,12 +1326,31 @@ async def solve_instance(
                             )
                             await status(f"Test gate FAILED — rejecting done")
                         else:
-                            baseline_note = ""
-                            if gate_result.exit_code != 0:
-                                baseline_note = " (pre-existing failures filtered)"
-                            await status(f"Test gate passed{baseline_note} — accepting done: {args.get('explanation', '')[:100]}")
-                            result = "Done acknowledged. Tests pass. The patch will be collected."
-                            done_signalled = True
+                            # Go compile-only cross-check: ensure all
+                            # packages compile (catches missed callers).
+                            go_ok = True
+                            if test_cmd.startswith("go test"):
+                                go_ok, go_err = await loop.run_in_executor(
+                                    None, lambda: _go_build_check(runner, test_cmd, COMMAND_TIMEOUT),
+                                )
+                                clog.log("go_build_check", phase="initial", passed=go_ok,
+                                         output=_truncate(go_err, 3000) if go_err else "")
+                            if not go_ok:
+                                qa_gate_failed = True
+                                go_err_trunc = _truncate(go_err, TEST_FAILURE_EXTRACT_LIMIT)
+                                result = (
+                                    f"DONE REJECTED — tests pass but some packages fail to compile. "
+                                    f"You may have changed an exported API without updating all callers.\n"
+                                    f"Build output:\n{go_err_trunc}"
+                                )
+                                await status("Go build check FAILED — rejecting done")
+                            else:
+                                baseline_note = ""
+                                if gate_result.exit_code != 0:
+                                    baseline_note = " (pre-existing failures filtered)"
+                                await status(f"Test gate passed{baseline_note} — accepting done: {args.get('explanation', '')[:100]}")
+                                result = "Done acknowledged. Tests pass. The patch will be collected."
+                                done_signalled = True
                     else:
                         if gate_outcome_first is None:
                             gate_outcome_first = "no_gate"
@@ -1370,9 +1431,31 @@ async def solve_instance(
             except Exception as exc:  # noqa: BLE001
                 clog.log("gate_scope_audit", phase="step_limit", error=str(exc)[:200])
             if gate_passed:
-                baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
-                await status(f"Tests pass{baseline_note} despite no done signal — accepting patch")
-                done_signalled = True
+                # Go compile-only cross-check (same as main-loop gate)
+                go_ok = True
+                if test_cmd.startswith("go test"):
+                    go_ok, go_err = await loop.run_in_executor(
+                        None, lambda: _go_build_check(runner, test_cmd, COMMAND_TIMEOUT),
+                    )
+                    clog.log("go_build_check", phase="step_limit", passed=go_ok,
+                             output=_truncate(go_err, 3000) if go_err else "")
+                if not go_ok:
+                    qa_gate_failed = True
+                    go_err_trunc = _truncate(go_err, TEST_FAILURE_EXTRACT_LIMIT)
+                    items.append({
+                        "role": "user",
+                        "content": (
+                            f"Tests pass but some packages fail to compile. "
+                            f"You may have changed an exported API without updating all callers.\n"
+                            f"You have {QA_BUDGET} extra steps to fix this and call done.\n"
+                            f"Build output:\n{go_err_trunc}"
+                        ),
+                    })
+                    await status("Go build check FAILED at step limit — entering QA fix phase")
+                else:
+                    baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
+                    await status(f"Tests pass{baseline_note} despite no done signal — accepting patch")
+                    done_signalled = True
             else:
                 qa_gate_failed = True
                 fail_output = _truncate(gate_result.output or "(no output)", TEST_FAILURE_EXTRACT_LIMIT)
@@ -1537,11 +1620,30 @@ async def solve_instance(
                         except Exception as exc:  # noqa: BLE001
                             clog.log("gate_scope_audit", phase="qa", error=str(exc)[:200])
                         if gate_passed:
-                            baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
-                            await status(f"QA test gate passed{baseline_note} — accepting done")
-                            fc_result = "Done acknowledged. Tests pass. The patch will be collected."
-                            done_signalled = True
-                            qa_done = True
+                            # Go compile-only cross-check (same as main-loop gate)
+                            go_ok = True
+                            if test_cmd.startswith("go test"):
+                                go_ok, go_err = await loop.run_in_executor(
+                                    None, lambda: _go_build_check(runner, test_cmd, COMMAND_TIMEOUT),
+                                )
+                                clog.log("go_build_check", phase="qa", passed=go_ok,
+                                         output=_truncate(go_err, 3000) if go_err else "")
+                            if not go_ok:
+                                remaining = QA_BUDGET - qa_steps_used
+                                go_err_trunc = _truncate(go_err, TEST_FAILURE_EXTRACT_LIMIT)
+                                fc_result = (
+                                    f"DONE REJECTED — tests pass but some packages fail to compile. "
+                                    f"Fix all callers. {remaining} QA steps remaining.\n"
+                                    f"Build output:\n{go_err_trunc}"
+                                )
+                                gate_outcome_after_qa = "fail"
+                                await status("QA Go build check FAILED — rejecting done")
+                            else:
+                                baseline_note = " (pre-existing failures filtered)" if gate_result.exit_code != 0 else ""
+                                await status(f"QA test gate passed{baseline_note} — accepting done")
+                                fc_result = "Done acknowledged. Tests pass. The patch will be collected."
+                                done_signalled = True
+                                qa_done = True
                         else:
                             remaining = QA_BUDGET - qa_steps_used
                             fail_output = _truncate(gate_result.output or "(no output)", TEST_FAILURE_EXTRACT_LIMIT)
@@ -1603,8 +1705,13 @@ async def solve_instance(
                     "content": f"[QA fix step {qa_steps_used}/{QA_BUDGET}]",
                 })
 
-        # Collect the diff
-        diff = await loop.run_in_executor(None, runner.get_diff)
+        # Collect the diff — defend against container exit / crash
+        try:
+            diff = await loop.run_in_executor(None, runner.get_diff)
+        except Exception as exc:
+            logger.error("[%s] get_diff failed: %s", instance_id, exc)
+            clog.log("get_diff_error", error=str(exc)[:500])
+            diff = ""
 
         # ---- QA-phase instrumentation summary ----
         # If QA ran, capture the post-QA diff and decide whether the

@@ -110,7 +110,7 @@ class DockerRunner:
         if not self._container:
             raise RuntimeError("Container not started")
 
-        wrapped = ["timeout", "--kill-after=5", f"{timeout}s", "bash", "-c", cmd]
+        wrapped = ["timeout", "-k", "5", f"{timeout}s", "bash", "-c", cmd]
         exec_result = self._container.exec_run(
             wrapped,
             workdir=REPO_DIR,
@@ -199,6 +199,16 @@ class DockerRunner:
         "zip", "tar", "gz", "bz2", "xz",
     )
 
+    def is_running(self) -> bool:
+        """Check if the container is still running."""
+        if not self._container:
+            return False
+        try:
+            self._container.reload()
+            return self._container.status == "running"
+        except Exception:
+            return False
+
     def get_diff(self) -> str:
         """Return the current git diff in the container.
 
@@ -213,6 +223,10 @@ class DockerRunner:
         """
         if not self._container:
             raise RuntimeError("Container not started")
+        if not self.is_running():
+            logger.error("Container %s is not running — cannot collect diff",
+                         self._container.short_id)
+            return ""
         patch_path = "/tmp/_patch.diff"
 
         # Build grep patterns to exclude junk directories and extensions.

@@ -1,6 +1,21 @@
-# SWE-bench Pro Purple Agent
+# AgentWhetters SWE-bench Pro Purple Agent
 
 A2A coding agent that solves [SWE-bench Pro](https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro) problems. Receives issue descriptions from the green agent, analyses the repository in a Docker container, and returns a fix patch.
+
+## Abstract
+
+We present a simple, flat agent loop for automated software engineering on the
+SWE-bench Pro benchmark. The agent receives a problem statement and a Docker
+image of the target repository, runs a bash shell inside the container, and
+iterates until it produces a passing patch or exhausts its step budget. Before
+any edits begin, the agent probes the repository's own test runner to discover
+the test command and capture pre-existing failures. When the agent is complete,
+it calls a tool, `done`. The test gate rejects `done` calls whose patches break
+existing tests, and a short QA fix phase provides additional turns to recover. A
+post-loop gate collects whatever diff exists if the step limit is reached
+without a `done` call. The system uses a single reasoning model, GPT-5.4 at
+`high` effort, with no strategy abstraction, no separate planning phase, and no
+retrieval augmentation.
 
 ## How it works (simple_loop architecture)
 

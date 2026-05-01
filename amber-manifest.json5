@@ -1,0 +1,48 @@
+{
+  manifest_version: "0.3.0",
+  experimental_features: ["docker"],
+
+  config_schema: {
+    type: "object",
+    properties: {
+      openai_api_key: { type: "string", secret: true },
+      openai_model: { type: "string" },
+      azure_openai_endpoint: { type: "string" },
+      azure_openai_deployment: { type: "string" },
+      azure_openai_api_version: { type: "string" },
+    },
+    required: ["openai_api_key"],
+    additionalProperties: false,
+  },
+
+  program: {
+    image: "ghcr.io/paulwhitten/agentwhetters-swebench-purple:latest",
+    entrypoint: "uv run src/purple/server.py --host 0.0.0.0 --port 9022",
+
+    env: {
+      OPENAI_API_KEY: "${config.openai_api_key}",
+      OPENAI_MODEL: "${config.openai_model}",
+      AZURE_OPENAI_ENDPOINT: "${config.azure_openai_endpoint}",
+      AZURE_OPENAI_DEPLOYMENT: "${config.azure_openai_deployment}",
+      AZURE_OPENAI_API_VERSION: "${config.azure_openai_api_version}",
+    },
+
+    mounts: [
+      { path: "/var/run/docker.sock", from: "framework.docker" },
+    ],
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9022 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: {
+    a2a: "a2a",
+  },
+}

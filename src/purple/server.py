@@ -469,9 +469,13 @@ def _discover_test_command(runner: DockerRunner) -> str | None:
             pkg = json.loads(r.output)
             scripts = pkg.get("scripts", {})
             if "test" in scripts:
-                return "npm test"
+                r2 = runner.run("which npm 2>/dev/null")
+                if r2.exit_code == 0:
+                    return "npm test"
             if "check" in scripts:
-                return "npm run check"
+                r2 = runner.run("which npm 2>/dev/null")
+                if r2.exit_code == 0:
+                    return "npm run check"
         except json.JSONDecodeError:
             pass
 
@@ -1487,6 +1491,20 @@ async def solve_instance(
             # analysis — see docs/plan.md workstream 2).
             diff_before_qa = await loop.run_in_executor(None, runner.get_diff)
             clog.log("qa_phase_start", diff_len=len(diff_before_qa.strip()))
+
+            # Re-inject the original problem statement so the model
+            # retains full context after potential compaction.
+            items.append({
+                "role": "user",
+                "content": (
+                    f"## REMINDER — Original problem statement\n"
+                    f"You have used {total_steps} steps. The test gate has rejected your patch.\n"
+                    f"Re-read the requirements carefully and ensure your implementation "
+                    f"satisfies them exactly.\n\n"
+                    f"{_truncate(problem, 6000)}"
+                ),
+            })
+
             qa_stale_reject_count = 0       # consecutive gate rejections w/ unchanged diff
             qa_last_rejected_diff: str | None = None
             for qa_step in range(QA_BUDGET):
@@ -1801,7 +1819,7 @@ class SWEBenchPurpleAgent(AgentExecutor):
 
     def __init__(self, *, debug: bool = False):
         self._debug = debug
-        self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._model = os.getenv("OPENAI_MODEL", "gpt-5.4")
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         self._client = _make_openai_client(api_key, base_url) if api_key else None
@@ -1947,10 +1965,10 @@ def prepare_agent_card(url: str) -> AgentCard:
         examples=[],
     )
     return AgentCard(
-        name="AgentWhetters_SWEBench",
-        description="OpenAI-powered coding agent for SWE-bench Pro evaluations.",
+        name="AgentWhetters_SWEBenchProPurple",
+        description="gpt-5.4 powered coding agent for SWE-bench Pro evaluations.",
         url=url,
-        version="0.2.0",
+        version="1.0.0",
         default_input_modes=["text"],
         default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),

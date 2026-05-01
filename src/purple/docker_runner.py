@@ -242,13 +242,17 @@ class DockerRunner:
         # The subshell + || true ensures a zero exit even when grep filters
         # out every line (exit 1) or there are no untracked files at all.
         # After the diff is captured, git reset undoes the intent-to-add.
+        # Use "git diff HEAD" to capture both staged and unstaged changes
+        # relative to the last commit.  Plain "git diff" misses files that
+        # the agent already staged with "git add".
         self.run(
             f"(git ls-files --others --exclude-standard"
             f" | grep -v -E '(^|/)({dir_pat})(/)'"
             f" | grep -v -E '({substr_pat})'"
             f" | grep -v -E '\\.({ext_pat})$'"  # noqa: ISC003
+            f" | grep -v -F '.swe_baseline_test_output.txt'"
             f" | xargs -r -d '\\n' git add -N -- || true)"
-            f" && git diff > {patch_path}"
+            f" && git diff HEAD -- . ':!.swe_baseline_test_output.txt' > {patch_path}"
             f" ; git reset 2>/dev/null || true"
         )
         bits, _stat = self._container.get_archive(patch_path)

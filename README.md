@@ -19,7 +19,7 @@ retrieval augmentation.
 
 ## How it works (simple_loop architecture)
 
-This agent runs a single flat agent loop with no strategy abstraction, no provider hierarchy, and no separate prompt modules. Full reference: [`docs/architecture-simple_loop.md`](../docs/architecture-simple_loop.md).
+This agent runs a single flat agent loop with no strategy abstraction, no provider hierarchy, and no separate prompt modules.
 
 1. **Receive** a JSON message from the green agent containing the
    problem statement, Docker image URI, base commit, repo name,

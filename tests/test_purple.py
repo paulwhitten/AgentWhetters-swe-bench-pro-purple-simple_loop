@@ -12,5 +12,5 @@ async def test_agent_card(purple_url):
         resp = await client.get(f"{purple_url}/.well-known/agent-card.json")
     assert resp.status_code == 200
     card = resp.json()
-    assert card["name"] == "AgentWhetters_SWEBench"
+    assert card["name"] == "AgentWhetters_SWEBenchProPurple"
     assert len(card["skills"]) >= 1

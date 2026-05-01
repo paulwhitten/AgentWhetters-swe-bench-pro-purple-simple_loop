@@ -19,17 +19,15 @@ retrieval augmentation.
 
 ## How it works (simple_loop architecture)
 
-This agent runs a single flat agent loop —
-no strategy abstraction, no provider hierarchy, no separate prompt
-modules. Full reference: [`docs/architecture-simple_loop.md`](../docs/architecture-simple_loop.md).
+This agent runs a single flat agent loop with no strategy abstraction, no provider hierarchy, and no separate prompt modules. Full reference: [`docs/architecture-simple_loop.md`](../docs/architecture-simple_loop.md).
 
 1. **Receive** a JSON message from the green agent containing the
    problem statement, Docker image URI, base commit, repo name,
    and optional hints.
-2. **Start container** — pull the image, start it with
+2. **Start container**: pull the image, start it with
    `tail -f /dev/null`, and `git checkout` the base commit so the
    repo is in a clean state.
-3. **Auto-start services** — heuristically launch Redis / MongoDB /
+3. **Auto-start services**: heuristically launch Redis / MongoDB /
    PostgreSQL when the repo's config files reference them.
 4. **Discover test command** — probe `package.json`, `pytest.ini`,
    `go.mod`, `Cargo.toml`, etc. in a fixed order; pick the first
@@ -42,18 +40,22 @@ modules. Full reference: [`docs/architecture-simple_loop.md`](../docs/architectu
    model driving a bash shell (native `shell_call` tool for
    reasoning models, `run_command` + `done` function-calling for
    classic models). Each turn appends a `[Turn N/50]` reminder.
-7. **Mechanical test gate** — when the model emits `done`, run the
-   discovered test command. If it passes, accept the patch. If it
-   fails, inject the failure output and reject `done`.
-8. **Post-loop test gate** — if the agent ran out of steps without
-   ever calling `done`, run the test command anyway. Pass → accept.
-   Fail → continue into the QA fix phase.
-9. **QA fix phase** — up to `QA_BUDGET = 15` extra turns to fix
-   failing tests; each `done` re-runs the gate.
+   An empty-patch guard rejects `done` calls when `git diff` is empty.
+7. **Mechanical test gate**: when the model emits `done`, run the
+   discovered test command. A baseline-aware filter removes pre-existing
+   failures before deciding pass or fail. If the gate passes, accept
+   the patch. If it fails, inject the failure output and reject `done`.
+8. **Post-loop test gate**: if the agent ran out of steps without
+   ever calling `done`, run the test command anyway. On pass, accept
+   the patch. On fail, continue into the QA fix phase.
+9. **QA fix phase**: up to `QA_BUDGET = 5` extra turns to fix
+   failing tests. Each `done` re-runs the test gate.
 10. **Return** the working tree's `git diff` to the green agent as
     an A2A artifact.
 
 The system prompt and tool set are chosen by a prefix check on the configured model name. Reasoning-class models receive a system prompt tuned for native shell tool use and have provider-side reasoning effort enabled. Other models receive a classic chat-style system prompt with explicit `run_command` and `done` function-calling tools. The exact prefix list and prompts live in `src/purple/server.py`.
+
+More details can be found in [Simple Loop Architecture](./docs/architecture-simple_loop.md)
 
 ## Quick start
 

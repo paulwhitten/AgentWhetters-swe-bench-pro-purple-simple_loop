@@ -15,4 +15,4 @@ endpoint = "http://127.0.0.1:9022"
 cmd = "uv run src/purple/server.py --host 127.0.0.1 --port 9022 --debug"
 
 [config]
-num_instances = 10
+num_instances = 2

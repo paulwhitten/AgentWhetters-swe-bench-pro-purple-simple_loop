@@ -1164,6 +1164,8 @@ async def solve_instance(
             else:
                 api_kwargs["temperature"] = 0.0
                 api_kwargs["max_output_tokens"] = 4096
+            if not os.getenv("AZURE_OPENAI_ENDPOINT", "").strip():
+                api_kwargs["service_tier"] = "priority"
 
             try:
                 response = await client.responses.create(**api_kwargs)
@@ -1175,6 +1177,9 @@ async def solve_instance(
                 await status(f"API rejected prompt at step {step} — returning current diff")
                 break
 
+            resp_tier = getattr(response, "service_tier", None)
+            if resp_tier:
+                logger.info("[%s] step %d service_tier=%s", instance_id, step, resp_tier)
             usage = response.usage
             if usage:
                 cumulative_input_tokens += usage.input_tokens
@@ -1530,8 +1535,13 @@ async def solve_instance(
                 else:
                     api_kwargs_qa["temperature"] = 0.0
                     api_kwargs_qa["max_output_tokens"] = 4096
+                if not os.getenv("AZURE_OPENAI_ENDPOINT", "").strip():
+                    api_kwargs_qa["service_tier"] = "priority"
 
                 response = await client.responses.create(**api_kwargs_qa)
+                qa_resp_tier = getattr(response, "service_tier", None)
+                if qa_resp_tier:
+                    logger.info("[%s] qa step %d service_tier=%s", instance_id, qa_step, qa_resp_tier)
                 qa_usage = response.usage
                 if qa_usage:
                     cumulative_input_tokens += qa_usage.input_tokens

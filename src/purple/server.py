@@ -1034,21 +1034,27 @@ async def solve_instance(
         _active_runners.append(runner)
 
         # Start required services
+        logger.info("[%s] Starting required services...", instance_id)
         svc_msgs = await loop.run_in_executor(None, lambda: _start_required_services(runner))
+        logger.info("[%s] Services started: %s", instance_id, svc_msgs or "(none)")
         for svc_msg in svc_msgs:
             await status(svc_msg)
 
         # Get repo overview
+        logger.info("[%s] Listing files...", instance_id)
         await status("Exploring repository structure...")
         tree = await loop.run_in_executor(
             None, lambda: runner.list_files(".", max_depth=2)
         )
         tree = _truncate(tree, 10_000)
+        logger.info("[%s] File listing done (%d chars)", instance_id, len(tree))
 
         # Discover test commands
+        logger.info("[%s] Discovering test command...", instance_id)
         test_cmd = await loop.run_in_executor(
             None, lambda: _discover_test_command(runner)
         )
+        logger.info("[%s] Test command: %s", instance_id, test_cmd or "(none)")
         if test_cmd:
             await status(f"Detected test command: {test_cmd}")
 
@@ -1057,10 +1063,13 @@ async def solve_instance(
         baseline_exit_code: int | None = None
         baseline_output_raw = ""
         if test_cmd:
+            logger.info("[%s] Running baseline tests (timeout=%ds)...", instance_id, COMMAND_TIMEOUT)
             await status("Running baseline tests...")
             baseline_result = await loop.run_in_executor(
                 None, lambda: runner.run(test_cmd, timeout=COMMAND_TIMEOUT)
             )
+            logger.info("[%s] Baseline tests done (exit=%d, output=%d chars)",
+                        instance_id, baseline_result.exit_code, len(baseline_result.output or ""))
             baseline_exit_code = baseline_result.exit_code
             baseline_output_raw = baseline_result.output or ""
             if baseline_result.exit_code != 0:
@@ -1139,6 +1148,7 @@ async def solve_instance(
 
         for step in range(STEP_LIMIT):
             await status(f"Step {step + 1}")
+            logger.info("[%s] === Step %d/%d ===", instance_id, step + 1, STEP_LIMIT)
 
             rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             clog.log(
@@ -1176,7 +1186,9 @@ async def solve_instance(
                 api_kwargs["service_tier"] = "priority"
 
             try:
+                logger.info("[%s] step %d: calling OpenAI API...", instance_id, step + 1)
                 response = await client.responses.create(**api_kwargs)
+                logger.info("[%s] step %d: API response received", instance_id, step + 1)
             except openai.BadRequestError as exc:
                 # Content filter or invalid prompt — log and break gracefully
                 logger.warning("[%s] OpenAI rejected prompt at step %d: %s",
@@ -1250,10 +1262,14 @@ async def solve_instance(
 
                 preview = commands[0][:80] if commands else ""
                 await status(f"[{step + 1}] $ {preview}{'...' if len(commands[0]) > 80 else ''}")
+                logger.info("[%s] step %d: shell: %s", instance_id, step + 1, preview)
 
                 results = await loop.run_in_executor(
                     None, lambda cmds=commands: _execute_shell(runner, cmds),
                 )
+                logger.info("[%s] step %d: shell done (exit=%s)",
+                            instance_id, step + 1,
+                            [r["outcome"].get("exit_code") for r in results])
 
                 max_output_length = TOOL_RESULT_LIMIT
                 if hasattr(sc, "action") and hasattr(sc.action, "max_output_length") and sc.action.max_output_length:
@@ -1285,6 +1301,7 @@ async def solve_instance(
                     args = {}
 
                 if name == "done":
+                    logger.info("[%s] step %d: 'done' signalled, checking patch...", instance_id, step + 1)
                     # ------- Empty-patch guard -------
                     diff_so_far = await loop.run_in_executor(None, runner.get_diff)
                     if not diff_so_far.strip():
@@ -1815,6 +1832,9 @@ async def solve_instance(
             escalation_reason=escalation_reason,
         )
         logger.info("[%s] Transcript: %s", instance_id, clog.path)
+        logger.info("[%s] SOLVE COMPLETE: steps=%d qa_steps=%d diff_len=%d tokens_in=%d tokens_out=%d",
+                    instance_id, total_steps, qa_steps_used, len(diff.strip()),
+                    cumulative_input_tokens, cumulative_output_tokens)
         # Only strip leading whitespace — trailing whitespace is significant
         # in diffs (e.g. blank context lines like " \n") and git apply
         # requires the patch to end with a newline.

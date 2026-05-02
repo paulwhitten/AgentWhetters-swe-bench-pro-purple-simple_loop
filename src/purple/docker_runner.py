@@ -3,12 +3,19 @@ Docker runner — executes commands and reads files inside SWE-bench eval contai
 
 The green agent sends a Docker image URI per instance. The purple agent pulls that
 image, starts a container, then explores the repo and generates patches inside it.
+
+Command execution uses ``subprocess.run`` with ``docker exec`` rather than
+docker-py's ``exec_run``.  The docker-py exec stream hangs indefinitely through
+amber's TCP Docker proxy (port 20000) because the proxy never sends EOF after the
+command completes.  The Docker CLI does not have this bug.
 """
 
 from __future__ import annotations
 
 import logging
+import subprocess
 import tarfile
+import time
 import io
 from dataclasses import dataclass
 
@@ -19,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 REPO_DIR = "/app"
 EXEC_TIMEOUT = 120  # seconds per command
+# Grace period added on top of the in-container coreutils timeout when waiting
+# for subprocess.run to return.  Covers Docker overhead and network latency.
+EXEC_WALL_GRACE = 30  # seconds
 
 
 @dataclass
@@ -101,30 +111,56 @@ class DockerRunner:
     def run(self, cmd: str, timeout: int = EXEC_TIMEOUT) -> ExecResult:
         """Execute a shell command inside the container and return its output.
 
-        docker-py's ``exec_run`` has no per-call timeout. To honor the
-        ``timeout`` argument we wrap the command with coreutils ``timeout``
-        so a hung command cannot consume the whole per-instance budget.
-        On timeout, the wrapper exits with 124 (TERM) or 137 (KILL after
-        grace period) and we annotate the output.
+        Uses ``subprocess.run`` with ``docker exec`` instead of docker-py's
+        ``exec_run``, which hangs through amber's TCP Docker proxy.
+
+        The command is wrapped with coreutils ``timeout`` inside the container
+        so it cannot run longer than *timeout* seconds.  ``subprocess.run``
+        adds a wall-clock deadline of ``timeout + EXEC_WALL_GRACE`` as a
+        safety net.
         """
         if not self._container:
             raise RuntimeError("Container not started")
 
-        wrapped = ["timeout", "-k", "5", f"{timeout}s", "bash", "-c", cmd]
-        exec_result = self._container.exec_run(
-            wrapped,
-            workdir=REPO_DIR,
-            demux=True,
-        )
-        stdout = (exec_result.output[0] or b"").decode(errors="replace") if exec_result.output else ""
-        stderr = (exec_result.output[1] or b"").decode(errors="replace") if exec_result.output else ""
+        cmd_preview = cmd[:120] + ("..." if len(cmd) > 120 else "")
+        logger.info("[exec] running (timeout=%ds): %s", timeout, cmd_preview)
+        t0 = time.monotonic()
+
+        docker_cmd = [
+            "docker", "exec", "-w", REPO_DIR, self._container.id,
+            "timeout", "-k", "5", f"{timeout}s",
+            "bash", "-c", cmd,
+        ]
+
+        try:
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                timeout=timeout + EXEC_WALL_GRACE,
+            )
+            exit_code = result.returncode
+            stdout = result.stdout.decode(errors="replace")
+            stderr = result.stderr.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - t0
+            logger.error(
+                "[exec] subprocess timed out after %.1fs: %s", elapsed, cmd_preview,
+            )
+            return ExecResult(
+                exit_code=137,
+                output=f"[subprocess timed out after {elapsed:.0f}s]",
+            )
+
+        elapsed = time.monotonic() - t0
+        logger.info("[exec] done in %.1fs (exit=%s): %s", elapsed, exit_code, cmd_preview)
+
         combined = stdout
         if stderr:
             combined = combined + "\n" + stderr if combined else stderr
-        if exec_result.exit_code in (124, 137):
+        if exit_code in (124, 137):
             note = f"\n[command timed out after {timeout}s]"
             combined = combined + note if combined else note.lstrip("\n")
-        return ExecResult(exit_code=exec_result.exit_code, output=combined)
+        return ExecResult(exit_code=exit_code, output=combined)
 
     def read_file(self, path: str, max_bytes: int = 100_000) -> str:
         """Read a file from the container."""

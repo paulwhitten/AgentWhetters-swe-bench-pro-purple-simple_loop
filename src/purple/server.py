@@ -1994,7 +1994,7 @@ def prepare_agent_card(url: str) -> AgentCard:
         name="AgentWhetters_SWEBenchProPurple",
         description="gpt-5.4 powered coding agent for SWE-bench Pro evaluations.",
         url=url,
-        version="1.0.6",
+        version="1.0.7",
         default_input_modes=["text"],
         default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),

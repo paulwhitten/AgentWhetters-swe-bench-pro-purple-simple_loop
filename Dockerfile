@@ -29,6 +29,6 @@ USER agent
 RUN uv sync --locked
 USER root
 
-ENTRYPOINT ["/entrypoint.sh", "uv", "run", "src/purple/server.py"]
-CMD ["--host", "0.0.0.0", "--port", "9022"]
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["uv", "run", "src/purple/server.py", "--host", "0.0.0.0", "--port", "9022"]
 EXPOSE 9022

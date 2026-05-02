@@ -14,7 +14,7 @@
 
   program: {
     image: "ghcr.io/paulwhitten/agentwhetters-swebench-purple:latest",
-    entrypoint: "uv run src/purple/server.py --host 0.0.0.0 --port 9022",
+    entrypoint: "/entrypoint.sh uv run src/purple/server.py --host 0.0.0.0 --port 9022",
 
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",

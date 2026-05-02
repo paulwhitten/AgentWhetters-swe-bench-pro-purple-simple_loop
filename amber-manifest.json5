@@ -22,9 +22,6 @@
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
       OPENAI_MODEL: "${config.openai_model}",
-      AZURE_OPENAI_ENDPOINT: "${config.azure_openai_endpoint}",
-      AZURE_OPENAI_DEPLOYMENT: "${config.azure_openai_deployment}",
-      AZURE_OPENAI_API_VERSION: "${config.azure_openai_api_version}",
     },
 
     mounts: [

@@ -53,6 +53,7 @@ from a2a.types import (
 )
 from uuid import uuid4
 from a2a.utils import new_agent_text_message
+import httpx
 import openai
 from openai import AsyncOpenAI, AsyncAzureOpenAI
 
@@ -108,6 +109,10 @@ COMPACT_THRESHOLD = 200_000   # Server-side compaction threshold (tokens)
 # OpenAI client factory
 # ---------------------------------------------------------------------------
 
+# Per-request timeout: 10 min connect, 30 min read (reasoning models are slow)
+_OPENAI_TIMEOUT = httpx.Timeout(connect=60.0, read=1800.0, write=60.0, pool=60.0)
+
+
 def _make_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenAI:
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
     if azure_endpoint:
@@ -116,8 +121,9 @@ def _make_openai_client(api_key: str, base_url: str | None = None) -> AsyncOpenA
             azure_endpoint=azure_endpoint,
             api_key=api_key,
             api_version=api_version,
+            timeout=_OPENAI_TIMEOUT,
         )
-    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    return AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=_OPENAI_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -1022,7 +1028,9 @@ async def solve_instance(
     clog = ConversationLogger(instance_id)
 
     try:
+        logger.info("[%s] Pulling image %s ...", instance_id, image_uri)
         await loop.run_in_executor(None, runner.start)
+        logger.info("[%s] Container started", instance_id)
         _active_runners.append(runner)
 
         # Start required services
@@ -1832,10 +1840,18 @@ class SWEBenchPurpleAgent(AgentExecutor):
         self._model = os.getenv("OPENAI_MODEL", "gpt-5.4")
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
         self._client = _make_openai_client(api_key, base_url) if api_key else None
         azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
         if azure_deployment:
             self._model = azure_deployment
+        logger.info(
+            "SWEBenchPurpleAgent init: model=%s api_key_set=%s base_url=%s azure_endpoint=%s",
+            self._model,
+            bool(api_key),
+            base_url or "(none)",
+            azure_endpoint or "(none)",
+        )
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         try:
@@ -1978,7 +1994,7 @@ def prepare_agent_card(url: str) -> AgentCard:
         name="AgentWhetters_SWEBenchProPurple",
         description="gpt-5.4 powered coding agent for SWE-bench Pro evaluations.",
         url=url,
-        version="1.0.2",
+        version="1.0.5",
         default_input_modes=["text"],
         default_output_modes=["text"],
         capabilities=AgentCapabilities(streaming=True),

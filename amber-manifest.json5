@@ -7,9 +7,6 @@
     properties: {
       openai_api_key: { type: "string", secret: true },
       openai_model: { type: "string" },
-      azure_openai_endpoint: { type: "string" },
-      azure_openai_deployment: { type: "string" },
-      azure_openai_api_version: { type: "string" },
     },
     required: ["openai_api_key"],
     additionalProperties: false,
@@ -22,6 +19,7 @@
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
       OPENAI_MODEL: "${config.openai_model}",
+      AGENT_DEBUG: "1",
     },
 
     mounts: [
